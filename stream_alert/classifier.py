@@ -220,7 +220,6 @@ class StreamClassifier(object):
         Returns:
             A boolean representing the success of the parse.
         """
-        logger.debug(data)
 
         for log_name, attributes in self.log_metadata(payload).iteritems():
             if not payload.type:
