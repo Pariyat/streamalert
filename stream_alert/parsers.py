@@ -16,6 +16,7 @@ limitations under the License.
 
 import csv
 import json
+import zlib
 import logging
 import re
 import StringIO
@@ -88,7 +89,8 @@ class JSONParser(ParserBase):
         try:
             json_payload = json.loads(data)
             self.payload_type = 'json'
-        except ValueError:
+        except ValueError as e:
+            logger.debug('JSON parse failed: %s', str(e))
             return False
 
         # top level key check
@@ -104,6 +106,27 @@ class JSONParser(ParserBase):
             return json_payload
         else:
             logger.debug('JSON Key mismatch: %s vs. %s', json_keys, schema_keys)
+            return False
+
+@parser
+class GzipJSONParser(JSONParser):
+    __parserid__ = 'gzip-json'
+
+    def parse(self):
+        """Parse a gzipped string into JSON.
+
+        Options:
+            - None
+
+        Returns:
+            - A dict of the parsed JSON record.
+            - False if the data is not Gzipped JSON or the columns do not match.
+        """
+        try:
+            json_payload = zlib.decompress(self.data,47)
+            self.data = json_payload
+            return super(GzipJSONParser,self).parse()
+        except zlib.error:
             return False
 
 @parser
@@ -126,14 +149,14 @@ class CSVParser(ParserBase):
             try:
                 csv_data = StringIO.StringIO(data)
                 reader = csv.DictReader(csv_data, delimiter=delimiter)
-            except ValueError:
+            except ValueError, csv.Error:
                 return False
 
         elif service == 'kinesis':
             try:
                 csv_data = StringIO.StringIO(data)
                 reader = csv.reader(csv_data, delimiter=delimiter)
-            except ValueError:
+            except ValueError, csv.Error:
                 return False
 
         return reader
@@ -157,34 +180,36 @@ class CSVParser(ParserBase):
         reader = self._get_reader()
         if not reader:
             return False
+        try:
+            for row in reader:
+                # check number of columns match and any hints match
+                if len(row) != len(schema):
+                    logger.debug('CSV Key mismatch: %s vs. %s', len(row), len(schema))
+                    return False
 
-        for row in reader:
-            # check number of columns match and any hints match
-            if len(row) != len(schema):
-                logger.debug('CSV Key mismatch: %s vs. %s', len(row), len(schema))
-                return False
+                for field, hint_list in hints.iteritems():
+                    # handle nested hints
+                    if not isinstance(hint_list, list):
+                        continue
+                    # the hint field index in the row
+                    field_index = schema.keys().index(field)
+                    # store results per hint
+                    hint_group_result = []
+                    for hint in hint_list:
+                        hint_group_result.append(fnmatch(row[field_index], hint))
+                    # append the result of any of the hints being True
+                    hint_result.append(any(hint_group_result))
 
-            for field, hint_list in hints.iteritems():
-                # handle nested hints
-                if not isinstance(hint_list, list):
-                    continue
-                # the hint field index in the row
-                field_index = schema.keys().index(field)
-                # store results per hint
-                hint_group_result = []
-                for hint in hint_list:
-                    hint_group_result.append(fnmatch(row[field_index], hint))
-                # append the result of any of the hints being True
-                hint_result.append(any(hint_group_result))
+                # if all hint group results are True
+                logger.debug('hint result: %s', hint_result)
+                if all(hint_result):
+                    self.payload_type = 'csv'
+                    for index, key in enumerate(schema):
+                        csv_payload[key] = row[index]
 
-            # if all hint group results are True
-            logger.debug('hint result: %s', hint_result)
-            if all(hint_result):
-                self.payload_type = 'csv'
-                for index, key in enumerate(schema):
-                    csv_payload[key] = row[index]
-
-                return csv_payload
+                    return csv_payload
+        except csv.Error:
+            return False
 
 @parser
 class KVParser(ParserBase):
@@ -211,30 +236,32 @@ class KVParser(ParserBase):
         separator = options['separator'] or self.__default_separator
 
         kv_payload = {}
+        try:
+            # remove any blank strings that may exist in our list
+            fields = filter(None, data.split(delimiter))
+            # first check the field length matches our # of keys
+            if len(fields) != len(schema):
+                logger.debug('Parsed KV fields: %s', fields)
+                return False
 
-        # remove any blank strings that may exist in our list
-        fields = filter(None, data.split(delimiter))
-        # first check the field length matches our # of keys
-        if len(fields) != len(schema):
-            logger.debug('Parsed KV fields: %s', fields)
-            return False
-
-        regex = re.compile('.+{}.+'.format(separator))
-        for index, field in enumerate(fields):
-            # verify our fields match the kv regex
-            if regex.match(field):
-                key, value = field.split(separator)
-                # handle duplicate keys
-                if key in kv_payload:
-                    # load key from our configuration
-                    kv_payload[schema.keys()[index]] = value
+            regex = re.compile('.+{}.+'.format(separator))
+            for index, field in enumerate(fields):
+                # verify our fields match the kv regex
+                if regex.match(field):
+                    key, value = field.split(separator)
+                    # handle duplicate keys
+                    if key in kv_payload:
+                        # load key from our configuration
+                        kv_payload[schema.keys()[index]] = value
+                    else:
+                        # load key from data
+                        kv_payload[key] = value
                 else:
-                    # load key from data
-                    kv_payload[key] = value
-            else:
-                logger.error('key/value regex failure for %s', field)
+                    logger.error('key/value regex failure for %s', field)
 
-        self.payload_type = 'kv'
+            self.payload_type = 'kv'
+        except UnicodeDecodeError:
+            return False
 
         return kv_payload
 
